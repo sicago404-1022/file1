@@ -1,116 +1,90 @@
-import os
-import uuid
-from flask import Flask, request, redirect, url_for, jsonify
-from flask_sqlalchemy import SQLAlchemy
-from flask_login import (
-    LoginManager, UserMixin,
-    login_user, login_required,
-    logout_user, current_user
-)
-from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.utils import secure_filename
+import streamlit as st
+from googleapiclient.discovery import build
+import pandas as pd
+from datetime import datetime
+import requests
+from io import BytesIO
 
-# ---------------- 기본 설정 ----------------
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'change-this'
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///memories.db'
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# --- 페이지 설정 ---
+st.set_page_config(page_title="YouTube 비디오 분석기", layout="wide")
+st.title("📊 YouTube 영상 정보 및 댓글 분석기")
 
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+# --- 사이드바: API 키 입력 ---
+with st.sidebar:
+    st.header("설정")
+    api_key = st.text_input("YouTube API Key를 입력하세요", type="password")
+    video_url = st.text_input("유튜브 영상 URL을 입력하세요")
 
-db = SQLAlchemy(app)
-login_manager = LoginManager(app)
+def get_video_id(url):
+    if "v=" in url:
+        return url.split("v=")[1].split("&")[0]
+    elif "be/" in url:
+        return url.split("be/")[1].split("?")[0]
+    return None
 
-# ---------------- DB 모델 ----------------
-class User(UserMixin, db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(100), unique=True, nullable=False)
-    password = db.Column(db.String(200), nullable=False)
+if api_key and video_url:
+    video_id = get_video_id(video_url)
+    
+    if video_id:
+        youtube = build("youtube", "v3", developerKey=api_key)
 
-class Memory(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    date = db.Column(db.String(10), nullable=False)   # YYYY-MM-DD
-    content = db.Column(db.Text, nullable=False)
-    image = db.Column(db.String(300))
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+        # 1. 영상 정보 가져오기
+        request = youtube.videos().list(
+            part="snippet,statistics",
+            id=video_id
+        )
+        response = request.execute()
 
-@login_manager.user_loader
-def load_user(user_id):
-    return User.query.get(int(user_id))
+        if response["items"]:
+            video_data = response["items"][0]
+            snippet = video_data["snippet"]
+            stats = video_data["statistics"]
 
-# ---------------- 인증 ----------------
-@app.route('/register', methods=['POST'])
-def register():
-    data = request.json
-    user = User(
-        username=data['username'],
-        password=generate_password_hash(data['password'])
-    )
-    db.session.add(user)
-    db.session.commit()
-    return jsonify({'message': '회원가입 완료'})
+            # 기본 정보 추출
+            title = snippet["title"]
+            published_at = datetime.strptime(snippet["publishedAt"], "%Y-%m-%dT%H:%M:%SZ")
+            view_count = int(stats.get("viewCount", 0))
+            comment_count = int(stats.get("commentCount", 0))
+            like_count = int(stats.get("likeCount", 0))
+            thumbnail_url = snippet["thumbnails"]["high"]["url"]
 
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.json
-    user = User.query.filter_by(username=data['username']).first()
-    if user and check_password_hash(user.password, data['password']):
-        login_user(user)
-        return jsonify({'message': '로그인 성공'})
-    return jsonify({'error': '로그인 실패'}), 401
+            # --- 화면 구성 ---
+            col1, col2 = st.columns([1, 2])
 
-@app.route('/logout')
-@login_required
-def logout():
-    logout_user()
-    return jsonify({'message': '로그아웃 완료'})
+            with col1:
+                st.image(thumbnail_url, caption="영상 썸네일")
+                # 썸네일 다운로드 버튼
+                response_img = requests.get(thumbnail_url)
+                st.download_button(
+                    label="🖼️ 썸네일 다운로드",
+                    data=BytesIO(response_img.content),
+                    file_name=f"{video_id}_thumbnail.jpg",
+                    mime="image/jpeg"
+                )
 
-# ---------------- 추억 업로드 ----------------
-@app.route('/upload', methods=['POST'])
-@login_required
-def upload():
-    date = request.form.get('date')
-    content = request.form.get('content')
-    file = request.files.get('image')
+            with col2:
+                st.subheader(title)
+                st.write(f"📅 **게시일:** {published_at.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                # 주요 지표 시각화
+                m1, m2, m3 = st.columns(3)
+                m1.metric("조회 수", f"{view_count:,}회")
+                m2.metric("댓글 수", f"{comment_count:,}개")
+                m3.metric("좋아요 수", f"{like_count:,}개")
 
-    filename = None
-    if file and file.filename:
-        ext = file.filename.rsplit('.', 1)[1].lower()
-        if ext in ['jpg', 'jpeg', 'png', 'gif']:
-            filename = f"{uuid.uuid4().hex}.{ext}"
-            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            st.divider()
 
-    memory = Memory(
-        date=date,
-        content=content,
-        image=filename,
-        user_id=current_user.id
-    )
-    db.session.add(memory)
-    db.session.commit()
+            # 데이터 요약 표
+            st.markdown("### 📝 영상 요약 정보")
+            summary_df = pd.DataFrame({
+                "항목": ["영상 제목", "게시 날짜", "조회 수", "댓글 수", "좋아요 수"],
+                "데이터": [title, published_at.date(), f"{view_count:,}", f"{comment_count:,}", f"{like_count:,}"]
+            })
+            st.table(summary_df)
 
-    return jsonify({'message': '추억 저장 완료'})
-
-# ---------------- 날짜별 조회 ----------------
-@app.route('/memories/<date>')
-@login_required
-def memories_by_date(date):
-    memories = Memory.query.filter_by(
-        user_id=current_user.id,
-        date=date
-    ).order_by(Memory.id.desc()).all()
-
-    return jsonify([
-        {
-            'content': m.content,
-            'image': m.image,
-            'date': m.date
-        } for m in memories
-    ])
-
-# ---------------- 실행 ----------------
-if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
-    app.run(debug=True)
+        else:
+            st.error("영상을 찾을 수 없습니다. URL을 확인해 주세요.")
+    else:
+        st.warning("올바른 유튜브 URL을 입력해 주세요.")
+else:
+    st.info("사이드바에 API 키와 영상 URL을 입력하면 분석이 시작됩니다.")
